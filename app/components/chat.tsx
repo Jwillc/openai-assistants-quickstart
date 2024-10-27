@@ -2,19 +2,28 @@
 
 import React, { useState, useEffect, useRef } from "react";
 import styles from "./chat.module.css";
-import { AssistantStream } from "openai/lib/AssistantStream";
 import Markdown from "react-markdown";
-// @ts-expect-error - no types for this yet
-import { AssistantStreamEvent } from "openai/resources/beta/assistants/assistants";
-import { RequiredActionFunctionToolCall } from "openai/resources/beta/threads/runs/runs";
 
 type MessageProps = {
-  role: "user" | "assistant" | "code";
+  role: "user" | "assistant";
   text: string;
+  imageUrl?: string;
 };
 
-const UserMessage = ({ text }: { text: string }) => {
-  return <div className={styles.userMessage}>{text}</div>;
+const UserMessage = ({ text, imageUrl }: { text: string; imageUrl?: string }) => {
+  return (
+    <div className={styles.userMessage}>
+      {imageUrl && (
+        <img 
+          src={imageUrl} 
+          alt="Uploaded content" 
+          className={styles.uploadedImage}
+          style={{ maxWidth: '200px', marginBottom: '8px' }} 
+        />
+      )}
+      {text}
+    </div>
+  );
 };
 
 const AssistantMessage = ({ text }: { text: string }) => {
@@ -25,235 +34,149 @@ const AssistantMessage = ({ text }: { text: string }) => {
   );
 };
 
-const CodeMessage = ({ text }: { text: string }) => {
-  return (
-    <div className={styles.codeMessage}>
-      {text.split("\n").map((line, index) => (
-        <div key={index}>
-          <span>{`${index + 1}. `}</span>
-          {line}
-        </div>
-      ))}
-    </div>
-  );
-};
-
-const Message = ({ role, text }: MessageProps) => {
+const Message = ({ role, text, imageUrl }: MessageProps) => {
   switch (role) {
     case "user":
-      return <UserMessage text={text} />;
+      return <UserMessage text={text} imageUrl={imageUrl} />;
     case "assistant":
       return <AssistantMessage text={text} />;
-    case "code":
-      return <CodeMessage text={text} />;
     default:
       return null;
   }
 };
 
-type ChatProps = {
-  functionCallHandler?: (
-    toolCall: RequiredActionFunctionToolCall
-  ) => Promise<string>;
-};
-
-const Chat = ({
-  functionCallHandler = () => Promise.resolve(""), // default to return empty string
-}: ChatProps) => {
+const Chat = () => {
   const [userInput, setUserInput] = useState("");
-  const [messages, setMessages] = useState([]);
-  const [inputDisabled, setInputDisabled] = useState(false);
-  const [threadId, setThreadId] = useState("");
+  const [messages, setMessages] = useState<MessageProps[]>([]);
+  const [isLoading, setIsLoading] = useState(false);
+  const [selectedImage, setSelectedImage] = useState<File | null>(null);
+  const [imagePreview, setImagePreview] = useState<string>("");
+  const [error, setError] = useState<string>("");
 
-  // automatically scroll to bottom of chat
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
+  
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   };
+
   useEffect(() => {
     scrollToBottom();
   }, [messages]);
 
-  // create a new threadID when chat component created
-  useEffect(() => {
-    const createThread = async () => {
-      const res = await fetch(`/api/assistants/threads`, {
-        method: "POST",
-      });
-      const data = await res.json();
-      setThreadId(data.threadId);
-    };
-    createThread();
-  }, []);
-
-  const sendMessage = async (text) => {
-    const response = await fetch(
-      `/api/assistants/threads/${threadId}/messages`,
-      {
-        method: "POST",
-        body: JSON.stringify({
-          content: text,
-        }),
+  const handleImageSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (file) {
+      // Check file size (20MB limit)
+      if (file.size > 20 * 1024 * 1024) {
+        setError("Image size must be less than 20MB");
+        return;
       }
-    );
-    const stream = AssistantStream.fromReadableStream(response.body);
-    handleReadableStream(stream);
-  };
 
-  const submitActionResult = async (runId, toolCallOutputs) => {
-    const response = await fetch(
-      `/api/assistants/threads/${threadId}/actions`,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          runId: runId,
-          toolCallOutputs: toolCallOutputs,
-        }),
+      // Check file type
+      if (!['image/jpeg', 'image/png', 'image/webp', 'image/gif'].includes(file.type)) {
+        setError("Only JPEG, PNG, WEBP, and non-animated GIF files are supported");
+        return;
       }
-    );
-    const stream = AssistantStream.fromReadableStream(response.body);
-    handleReadableStream(stream);
-  };
 
-  const handleSubmit = (e) => {
-    e.preventDefault();
-    if (!userInput.trim()) return;
-    sendMessage(userInput);
-    setMessages((prevMessages) => [
-      ...prevMessages,
-      { role: "user", text: userInput },
-    ]);
-    setUserInput("");
-    setInputDisabled(true);
-    scrollToBottom();
-  };
+      setSelectedImage(file);
+      setError("");
 
-  /* Stream Event Handlers */
-
-  // textCreated - create new assistant message
-  const handleTextCreated = () => {
-    appendMessage("assistant", "");
-  };
-
-  // textDelta - append text to last assistant message
-  const handleTextDelta = (delta) => {
-    if (delta.value != null) {
-      appendToLastMessage(delta.value);
-    };
-    if (delta.annotations != null) {
-      annotateLastMessage(delta.annotations);
+      // Create preview
+      const reader = new FileReader();
+      reader.onloadend = () => {
+        setImagePreview(reader.result as string);
+      };
+      reader.readAsDataURL(file);
     }
   };
 
-  // imageFileDone - show image in chat
-  const handleImageFileDone = (image) => {
-    appendToLastMessage(`\n![${image.file_id}](/api/files/${image.file_id})\n`);
-  }
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!userInput.trim() && !selectedImage) return;
 
-  // toolCallCreated - log new tool call
-  const toolCallCreated = (toolCall) => {
-    if (toolCall.type != "code_interpreter") return;
-    appendMessage("code", "");
+    setIsLoading(true);
+    setError("");
+
+    try {
+      if (selectedImage) {
+        const reader = new FileReader();
+        reader.readAsDataURL(selectedImage);
+        
+        reader.onloadend = async () => {
+          const base64Image = reader.result?.toString().split(',')[1]; // Remove data:image/jpeg;base64, prefix
+          
+          if (!base64Image) {
+            throw new Error("Failed to process image");
+          }
+
+          // Add message with image preview
+          setMessages(prev => [...prev, {
+            role: "user",
+            text: userInput || "What is in this image?",
+            imageUrl: imagePreview
+          }]);
+
+          const response = await fetch('/api/assistants/vision', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              imageBase64: base64Image,
+              question: userInput || "What is in this image?"
+            }),
+          });
+
+          if (!response.ok) {
+            const errorData = await response.json();
+            throw new Error(errorData.error || 'Failed to analyze image');
+          }
+
+          const data = await response.json();
+          
+          setMessages(prev => [...prev, {
+            role: "assistant",
+            text: data.result
+          }]);
+
+          // Clear image and preview
+          setSelectedImage(null);
+          setImagePreview("");
+        };
+
+        reader.onerror = () => {
+          throw new Error("Failed to read image file");
+        };
+      }
+
+      if (userInput.trim()) {
+        setMessages(prev => [...prev, {
+          role: "user",
+          text: userInput
+        }]);
+      }
+
+      setUserInput("");
+    } catch (error) {
+      setError(error instanceof Error ? error.message : 'An error occurred');
+      console.error('Error:', error);
+    } finally {
+      setIsLoading(false);
+      scrollToBottom();
+    }
   };
-
-  // toolCallDelta - log delta and snapshot for the tool call
-  const toolCallDelta = (delta, snapshot) => {
-    if (delta.type != "code_interpreter") return;
-    if (!delta.code_interpreter.input) return;
-    appendToLastMessage(delta.code_interpreter.input);
-  };
-
-  // handleRequiresAction - handle function call
-  const handleRequiresAction = async (
-    event: AssistantStreamEvent.ThreadRunRequiresAction
-  ) => {
-    const runId = event.data.id;
-    const toolCalls = event.data.required_action.submit_tool_outputs.tool_calls;
-    // loop over tool calls and call function handler
-    const toolCallOutputs = await Promise.all(
-      toolCalls.map(async (toolCall) => {
-        const result = await functionCallHandler(toolCall);
-        return { output: result, tool_call_id: toolCall.id };
-      })
-    );
-    setInputDisabled(true);
-    submitActionResult(runId, toolCallOutputs);
-  };
-
-  // handleRunCompleted - re-enable the input form
-  const handleRunCompleted = () => {
-    setInputDisabled(false);
-  };
-
-  const handleReadableStream = (stream: AssistantStream) => {
-    // messages
-    stream.on("textCreated", handleTextCreated);
-    stream.on("textDelta", handleTextDelta);
-
-    // image
-    stream.on("imageFileDone", handleImageFileDone);
-
-    // code interpreter
-    stream.on("toolCallCreated", toolCallCreated);
-    stream.on("toolCallDelta", toolCallDelta);
-
-    // events without helpers yet (e.g. requires_action and run.done)
-    stream.on("event", (event) => {
-      if (event.event === "thread.run.requires_action")
-        handleRequiresAction(event);
-      if (event.event === "thread.run.completed") handleRunCompleted();
-    });
-  };
-
-  /*
-    =======================
-    === Utility Helpers ===
-    =======================
-  */
-
-  const appendToLastMessage = (text) => {
-    setMessages((prevMessages) => {
-      const lastMessage = prevMessages[prevMessages.length - 1];
-      const updatedLastMessage = {
-        ...lastMessage,
-        text: lastMessage.text + text,
-      };
-      return [...prevMessages.slice(0, -1), updatedLastMessage];
-    });
-  };
-
-  const appendMessage = (role, text) => {
-    setMessages((prevMessages) => [...prevMessages, { role, text }]);
-  };
-
-  const annotateLastMessage = (annotations) => {
-    setMessages((prevMessages) => {
-      const lastMessage = prevMessages[prevMessages.length - 1];
-      const updatedLastMessage = {
-        ...lastMessage,
-      };
-      annotations.forEach((annotation) => {
-        if (annotation.type === 'file_path') {
-          updatedLastMessage.text = updatedLastMessage.text.replaceAll(
-            annotation.text,
-            `/api/files/${annotation.file_path.file_id}`
-          );
-        }
-      })
-      return [...prevMessages.slice(0, -1), updatedLastMessage];
-    });
-    
-  }
 
   return (
     <div className={styles.chatContainer}>
       <div className={styles.messages}>
         {messages.map((msg, index) => (
-          <Message key={index} role={msg.role} text={msg.text} />
+          <Message key={index} {...msg} />
         ))}
+        {error && (
+          <div className={styles.errorMessage}>
+            {error}
+          </div>
+        )}
         <div ref={messagesEndRef} />
       </div>
       <form
@@ -266,13 +189,38 @@ const Chat = ({
           value={userInput}
           onChange={(e) => setUserInput(e.target.value)}
           placeholder="Enter your question"
+          disabled={isLoading}
         />
+        <input
+          type="file"
+          accept="image/jpeg,image/png,image/webp,image/gif"
+          onChange={handleImageSelect}
+          disabled={isLoading}
+        />
+        {imagePreview && (
+          <div className={styles.imagePreview}>
+            <img 
+              src={imagePreview} 
+              alt="Preview" 
+              style={{ maxWidth: '100px', marginTop: '8px' }} 
+            />
+            <button 
+              type="button" 
+              onClick={() => {
+                setSelectedImage(null);
+                setImagePreview("");
+              }}
+            >
+              Clear
+            </button>
+          </div>
+        )}
         <button
           type="submit"
           className={styles.button}
-          disabled={inputDisabled}
+          disabled={isLoading || (!userInput.trim() && !selectedImage)}
         >
-          Send
+          {isLoading ? 'Processing...' : 'Send'}
         </button>
       </form>
     </div>
